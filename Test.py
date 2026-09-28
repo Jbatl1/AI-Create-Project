@@ -4,8 +4,6 @@ import numpy as np
 import pytesseract as pytes
 from matplotlib import pyplot as plt
 
-pytes.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-
 #this function loops through the ROI frames and checks for the presence of red pixels, which indicates a kill highlight and returns a list of tthe indexes of those frames.
 def findFramesWithKills(frames_dict):
     kill_frame_indices = []
@@ -129,8 +127,8 @@ def testTextExtraction():
     #craete ROI from grey image
     roi = getROI(image)
     cornerImage = cornerDetectTest(roi)
-    # cv.imshow("roi", roi)
-    # cv.imshow("corners", cornerImage)
+    cv.imshow("roi", roi)
+    cv.imshow("corners", cornerImage)
     # cv.imwrite("cornerResult.png", cornerImage)
     # cv.waitKey(0)
     # cv.destroyAllWindows()
