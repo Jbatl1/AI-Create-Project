@@ -119,7 +119,7 @@ def cornerDetectTest(img):
 
 def testTextExtraction():
     #get image from path
-    img_path = "csExampleKillFeed.jpg"
+    img_path = "clips/csExampleKillFeed.jpg"
     image = cv.imread(img_path)
 
 
