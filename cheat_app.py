@@ -15,6 +15,7 @@ your own computer.
 """
 
 import json
+import os
 import tempfile
 import threading
 import webbrowser
@@ -28,7 +29,7 @@ import cs2_kill_aim_telemetry as telemetry
 from build_dataset import window_features
 
 HOST, PORT = "127.0.0.1", 8000
-MODEL_DIR = Path("AI-Create-Project/models")
+MODEL_DIR = Path("models")
 MODEL_FILES = {
     "Linear regression": "linear.npz",
     "Logistic regression": "logistic.npz",
@@ -36,6 +37,8 @@ MODEL_FILES = {
 }
 TICK_RATE = 64
 MIN_KILLS = 5                      # fewer kills than this = too little to judge
+TOP_KILLS = 5                      # most suspicious kills listed per player
+REWIND_SECONDS = 5                 # "jump to" commands start this long before the kill
 MAX_UPLOAD_BYTES = 1_500_000_000   # 1.5 GB
 
 # Must match Step 1 of three_simple_models.ipynb (features that get a log transform)
@@ -116,6 +119,46 @@ def verdict(n_kills, n_flagging, n_models):
     return "review", "Needs a human look"
 
 
+def player_names(dem_path, kills):
+    """steamid -> in-game name, including victims who never got a kill themselves."""
+    names = dict(zip(kills["steamid"], kills["name"].astype(str)))
+    try:
+        events = telemetry.DemoParser(str(dem_path)).parse_event("player_death")
+        for sid_col, name_col in [("user_steamid", "user_name"), ("attacker_steamid", "attacker_name")]:
+            if sid_col in events.columns and name_col in events.columns:
+                for sid, name in zip(telemetry._norm_sid(events[sid_col]), events[name_col]):
+                    if pd.notna(name):
+                        names.setdefault(sid, str(name))
+    except Exception:
+        pass  # names are a nice-to-have; fall back to "unknown player"
+    return names
+
+
+def _number(value):
+    return None if pd.isna(value) else float(value)
+
+
+def top_kills(player_kills, names, n=TOP_KILLS):
+    """The player's n most suspicious kills, with the details needed to find them in the demo."""
+    top = player_kills.sort_values(["suspicion", "head_ang_err"], ascending=[False, True]).head(n)
+    out = []
+    for _, k in top.iterrows():
+        tick = int(k["kill_tick"])
+        out.append({
+            "tick": tick,
+            "seconds": tick / TICK_RATE,
+            "goto_tick": max(0, tick - REWIND_SECONDS * TICK_RATE),
+            "victim": names.get(str(k["target_steamid"]), "unknown player"),
+            "weapon": str(k.get("weapon", "")).replace("weapon_", "") if pd.notna(k.get("weapon")) else "",
+            "headshot": bool(k.get("headshot", 0)),
+            "suspicion": float(k["suspicion"]),
+            "head_err_deg": _number(k.get("head_ang_err")),
+            "ms_on_target": _number(k.get("ms_on_target")),
+            "flick_deg_per_s": _number(k.get("approach_peak_ang_vel")),
+        })
+    return out
+
+
 def analyze_demo(dem_path):
     with tempfile.TemporaryDirectory() as tmp:
         ticks_csv, summary_csv = Path(tmp) / "ticks.csv", Path(tmp) / "summary.csv"
@@ -143,6 +186,10 @@ def analyze_demo(dem_path):
         kills[name] = score
         models_out.append({"name": name, "threshold": float(np.clip(model["threshold"], 0, 1))})
 
+    # A kill's suspicion = the average of the three models' scores for it
+    kills["suspicion"] = kills[[m["name"] for m in models_out]].mean(axis=1)
+    names = player_names(dem_path, kills)
+
     players = []
     for steamid, g in kills.groupby("steamid"):
         scores = {m["name"]: float(g[m["name"]].mean()) for m in models_out}
@@ -150,7 +197,8 @@ def analyze_demo(dem_path):
         level, text = verdict(len(g), n_flagging, len(models_out))
         players.append({"name": str(g["name"].iloc[0]), "steamid": steamid, "kills": len(g),
                         "scores": scores, "models_flagging": int(n_flagging),
-                        "verdict": level, "verdict_text": text})
+                        "verdict": level, "verdict_text": text,
+                        "top_kills": top_kills(g, names)})
 
     order = {"flag": 0, "review": 1, "clean": 2, "few": 3}
     players.sort(key=lambda p: (order[p["verdict"]], -np.mean(list(p["scores"].values()))))
@@ -278,7 +326,40 @@ tr:last-child td { border-bottom: 0; }
 .key .k-over { width: 18px; height: 8px; border-radius: 4px; background: var(--flag); }
 .notes { margin-top: 28px; color: var(--slate); font-size: .92rem; max-width: 70ch; }
 .notes p { margin: 0 0 8px; }
-@media (prefers-reduced-motion: reduce) { .spinner { animation: none; } .drop { transition: none; } }
+.expand { all: unset; cursor: pointer; display: inline-flex; align-items: center; gap: 8px;
+          font: 600 1.1rem/1.2 var(--cond); color: var(--ink); border-radius: 4px; }
+.expand:focus-visible { outline: 3px solid var(--review); outline-offset: 3px; }
+.expand::before { content: ""; width: 0; height: 0; border-left: 6px solid var(--slate);
+                  border-top: 5px solid transparent; border-bottom: 5px solid transparent; transition: transform .15s; }
+.expand[aria-expanded="true"]::before { transform: rotate(90deg); }
+.expand:hover { text-decoration: underline; text-underline-offset: 3px; }
+
+tr.detail > td { background: var(--paper); padding: 4px 16px 18px 40px; }
+tr.detail[hidden] { display: none; }
+.detail-inner { position: sticky; left: 0; max-width: calc(100vw - 64px); }
+.detail h3 { font: 600 1rem/1.3 var(--cond); color: var(--slate); margin: 12px 0 6px; }
+.kills-list { list-style: none; margin: 0; padding: 0; }
+.kill { display: grid; grid-template-columns: 76px minmax(0, 1fr) 72px auto; gap: 4px 18px; align-items: center;
+        padding: 12px 0; border-top: 1px solid var(--rule); }
+.kill:first-child { border-top: 0; }
+.clock { display: block; font: 600 1.25rem/1 var(--cond); font-variant-numeric: tabular-nums; }
+.tick { display: block; color: var(--slate); font-size: .8rem; margin-top: 3px; }
+.what p { margin: 0; }
+.facts { display: flex; flex-wrap: wrap; gap: 2px 16px; color: var(--slate); font-size: .88rem; margin-top: 2px !important; }
+.susp { font: 600 1.15rem/1 var(--cond); text-align: right; font-variant-numeric: tabular-nums; }
+.susp small { display: block; font: 400 .75rem var(--body); color: var(--slate); margin-top: 3px; }
+.jump { display: flex; align-items: center; gap: 8px; }
+.jump code { font: 500 .85rem/1 var(--cond); background: var(--sheet); border: 1px solid var(--rule);
+             border-radius: 4px; padding: 6px 8px; white-space: nowrap; }
+.copy { font: 600 .85rem/1 var(--cond); color: var(--ink); background: var(--sheet); border: 1px solid var(--ink);
+        border-radius: 4px; padding: 6px 10px; cursor: pointer; min-width: 64px; }
+.copy:focus-visible { outline: 3px solid var(--review); outline-offset: 2px; }
+@media (max-width: 640px) {
+  tr.detail > td { padding-left: 16px; }
+  .kill { grid-template-columns: 64px minmax(0, 1fr) 56px; }
+  .jump { grid-column: 1 / -1; }
+}
+@media (prefers-reduced-motion: reduce) { .spinner { animation: none; } .drop, .expand::before { transition: none; } }
 </style>
 </head>
 <body>
@@ -314,6 +395,8 @@ tr:last-child td { border-bottom: 0; }
       cut-off marks rather than reading the numbers on their own.</p>
       <p>"Likely cheating" means all three models put the player past their cut-off. When the models
       disagree, a person should watch the demo. Players without a gun kill aren't listed.</p>
+      <p>Kill times count from the start of the demo file, warmup included. To watch a kill, paste its
+      command into the CS2 console while the demo is playing; it jumps to five seconds before the kill.</p>
     </div>
   </section>
 </main>
@@ -357,13 +440,15 @@ function render(fileName, data) {
   const review = data.players.filter(p => p.verdict === "review").length;
   document.getElementById("summary").textContent =
     `${data.kills} gun kills by ${data.players.length} players. ` +
-    `${flagged} likely cheating, ${review} need a human look.`;
+    `${flagged} likely cheating, ${review} need a human look. ` +
+    `Open a player to see their most suspicious kills.`;
 
   document.getElementById("head").innerHTML =
     `<th>Player</th><th>Verdict</th><th style="text-align:right">Kills</th>` +
     data.models.map(m => `<th>${esc(m.name)}</th>`).join("");
 
-  document.getElementById("rows").innerHTML = data.players.map(p => {
+  const columns = 3 + data.models.length;
+  document.getElementById("rows").innerHTML = data.players.map((p, i) => {
     const cells = data.models.map(m => {
       const s = p.scores[m.name];
       const over = s >= m.threshold;
@@ -376,12 +461,61 @@ function render(fileName, data) {
     }).join("");
     const detail = p.verdict === "few" ? `${p.kills} kill${p.kills === 1 ? "" : "s"}`
                  : `${p.models_flagging} of ${data.models.length} models past cut-off`;
-    return `<tr><td class="player">${esc(p.name)}</td>
+    return `<tr><td class="player">
+        <button class="expand" aria-expanded="false" aria-controls="detail-${i}">${esc(p.name)}</button></td>
       <td><div class="verdict v-${p.verdict}">${esc(p.verdict_text)}<small>${detail}</small></div></td>
-      <td class="kills">${p.kills}</td>${cells}</tr>`;
+      <td class="kills">${p.kills}</td>${cells}</tr>
+      <tr class="detail" id="detail-${i}" hidden><td colspan="${columns}"><div class="detail-inner">${killList(p)}</div></td></tr>`;
   }).join("");
   document.getElementById("results").hidden = false;
 }
+
+function clock(seconds) {
+  const m = Math.floor(seconds / 60), s = Math.floor(seconds % 60);
+  return `${m}:${String(s).padStart(2, "0")}`;
+}
+
+function killList(p) {
+  const n = p.top_kills.length;
+  const heading = n === 1 ? "Their only kill" : `${n === p.kills ? "All" : "Top"} ${n} kills, most suspicious first`;
+  const items = p.top_kills.map(k => {
+    const facts = [];
+    if (k.head_err_deg !== null) facts.push(`${k.head_err_deg.toFixed(k.head_err_deg < 1 ? 2 : 1)}° from head centre`);
+    if (k.ms_on_target !== null) facts.push(`fired ${Math.round(k.ms_on_target)} ms after reaching the head`);
+    else facts.push("crosshair wasn't on the head");
+    if (k.flick_deg_per_s !== null) facts.push(`${Math.round(k.flick_deg_per_s).toLocaleString()}°/s snap`);
+    const how = [k.weapon && `with ${esc(k.weapon)}`, k.headshot && "headshot"].filter(Boolean).join(", ");
+    const cmd = `demo_gototick ${k.goto_tick}`;
+    return `<li class="kill">
+      <div><span class="clock">${clock(k.seconds)}</span><span class="tick">tick ${k.tick.toLocaleString()}</span></div>
+      <div class="what"><p>Killed <strong>${esc(k.victim)}</strong>${how ? " " + how : ""}</p>
+        <p class="facts">${facts.map(f => `<span>${f}</span>`).join("")}</p></div>
+      <div class="susp">${Math.round(k.suspicion * 100)}%<small>suspicion</small></div>
+      <div class="jump"><code>${cmd}</code><button class="copy" data-cmd="${cmd}">Copy</button></div>
+    </li>`;
+  }).join("");
+  return `<h3>${heading}</h3><ol class="kills-list">${items}</ol>`;
+}
+
+document.getElementById("rows").addEventListener("click", async e => {
+  const toggle = e.target.closest(".expand");
+  if (toggle) {
+    const open = toggle.getAttribute("aria-expanded") === "true";
+    toggle.setAttribute("aria-expanded", String(!open));
+    document.getElementById(toggle.getAttribute("aria-controls")).hidden = open;
+    return;
+  }
+  const copy = e.target.closest(".copy");
+  if (copy) {
+    try {
+      await navigator.clipboard.writeText(copy.dataset.cmd);
+      copy.textContent = "Copied";
+    } catch {
+      copy.textContent = "Select it";
+    }
+    setTimeout(() => { copy.textContent = "Copy"; }, 1500);
+  }
+});
 
 input.addEventListener("change", () => analyse(input.files[0]));
 ["dragenter", "dragover"].forEach(t => drop.addEventListener(t, e => { e.preventDefault(); drop.classList.add("over"); }));
@@ -395,6 +529,7 @@ drop.addEventListener("drop", e => analyse(e.dataTransfer.files[0]));
 
 def main():
     global MODELS
+    os.chdir(Path(__file__).resolve().parent)  # relative paths start from this script's folder
     MODELS = load_all_models()
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     url = f"http://{HOST}:{PORT}"
